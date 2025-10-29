@@ -14,16 +14,20 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import queue
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, Tuple
 from urllib import error, request
+from urllib.parse import urlparse
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -239,6 +243,221 @@ class BlueMuseClient:
         self._request("POST", self._endpoints["disconnect_all"])
 
 
+@dataclass
+class BlueMuseReleaseInfo:
+    """BlueMuse 최신 릴리스 메타데이터."""
+
+    version: str
+    asset_name: str
+    download_url: str
+
+
+class BlueMuseInstaller:
+    """GitHub 릴리스에서 BlueMuse 설치 파일을 내려받고 실행."""
+
+    _RELEASE_API = "https://api.github.com/repos/kowalej/BlueMuse/releases/latest"
+
+    def __init__(self) -> None:
+        self._opener = request.build_opener()
+
+    def fetch_latest_release(self) -> BlueMuseReleaseInfo:
+        req = request.Request(
+            self._RELEASE_API,
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "MuseFlow"},
+        )
+        try:
+            with self._opener.open(req, timeout=10.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except error.URLError as err:
+            raise BlueMuseError(f"GitHub에서 BlueMuse 릴리스를 불러오지 못했습니다: {err.reason}") from err
+        except json.JSONDecodeError as err:
+            raise BlueMuseError("GitHub 릴리스 응답을 해석하지 못했습니다.") from err
+
+        assets = payload.get("assets") if isinstance(payload, dict) else None
+        if not assets:
+            raise BlueMuseError("BlueMuse 릴리스에 다운로드 가능한 자산이 없습니다.")
+
+        preferred_suffixes = (".msi", ".exe", ".msixbundle", ".msix")
+        selected_asset: Optional[dict] = None
+        for suffix in preferred_suffixes:
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                name = str(asset.get("name") or "")
+                browser_download_url = str(asset.get("browser_download_url") or "")
+                if name.lower().endswith(suffix) and browser_download_url:
+                    selected_asset = asset
+                    break
+            if selected_asset:
+                break
+
+        if not selected_asset:
+            raise BlueMuseError("Windows용 BlueMuse 설치 파일을 찾을 수 없습니다.")
+
+        version = str(payload.get("tag_name") or payload.get("name") or "unknown")
+        return BlueMuseReleaseInfo(
+            version=version,
+            asset_name=str(selected_asset.get("name")),
+            download_url=str(selected_asset.get("browser_download_url")),
+        )
+
+    def download_installer(self, release: BlueMuseReleaseInfo) -> Path:
+        suffix = Path(release.asset_name).suffix or ".exe"
+        fd, temp_name = tempfile.mkstemp(prefix="bluemuse_", suffix=suffix)
+        os.close(fd)
+        temp_file = Path(temp_name)
+
+        req = request.Request(
+            release.download_url,
+            headers={"User-Agent": "MuseFlow", "Accept": "application/octet-stream"},
+        )
+        try:
+            with self._opener.open(req, timeout=60.0) as response, open(temp_file, "wb") as target:
+                shutil.copyfileobj(response, target)
+        except error.URLError as err:
+            raise BlueMuseError(f"BlueMuse 설치 파일 다운로드 실패: {err.reason}") from err
+        except OSError as err:
+            raise BlueMuseError(f"설치 파일 저장 실패: {err}") from err
+
+        return temp_file
+
+    @staticmethod
+    def run_installer(installer_path: Path) -> None:
+        try:
+            subprocess.Popen([str(installer_path)])
+        except OSError as err:
+            raise BlueMuseError(f"설치 프로그램 실행 실패: {err}") from err
+
+    @staticmethod
+    def detect_executable() -> Optional[Path]:
+        candidates: list[Path] = []
+
+        env_paths = {
+            "ProgramFiles": os.environ.get("ProgramFiles"),
+            "ProgramFiles(x86)": os.environ.get("ProgramFiles(x86)"),
+            "LOCALAPPDATA": os.environ.get("LOCALAPPDATA"),
+        }
+
+        for key, base_dir in env_paths.items():
+            if not base_dir:
+                continue
+            base = Path(base_dir)
+            if key == "LOCALAPPDATA":
+                candidates.append(base / "Programs" / "BlueMuse" / "BlueMuse.exe")
+                candidates.extend((base / "Programs").glob("BlueMuse*/BlueMuse.exe"))
+                candidates.append(base / "BlueMuse" / "BlueMuse.exe")
+            else:
+                candidates.append(base / "BlueMuse" / "BlueMuse.exe")
+                candidates.append(base / "BlueMuse" / "app" / "BlueMuse.exe")
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+
+        return None
+
+
+class BlueMuseSettingsManager:
+    """BlueMuse 설정 파일을 갱신해 원격 제어 서버를 자동 활성화."""
+
+    _SEARCH_PATTERNS = (
+        Path("BlueMuse/settings.json"),
+        Path("BlueMuse/Settings.json"),
+        Path("BlueMuse/settings/settings.json"),
+        Path("BlueMuse/Settings/settings.json"),
+        Path("Packages"),
+    )
+
+    def __init__(self) -> None:
+        appdata_raw = os.environ.get("APPDATA")
+        localappdata_raw = os.environ.get("LOCALAPPDATA")
+        self._appdata = Path(appdata_raw).expanduser() if appdata_raw else None
+        self._localappdata = Path(localappdata_raw).expanduser() if localappdata_raw else None
+
+    def _candidate_files(self) -> list[Path]:
+        candidates: list[Path] = []
+        for base in filter(None, (self._appdata, self._localappdata)):
+            for pattern in self._SEARCH_PATTERNS:
+                candidate = base / pattern
+                if pattern == Path("Packages"):
+                    packages_dir = candidate
+                    if packages_dir.is_dir():
+                        for path in packages_dir.glob("BlueMuse*/LocalState/settings.json"):
+                            candidates.append(path)
+                    continue
+                if candidate.is_file():
+                    candidates.append(candidate)
+        return candidates
+
+    @staticmethod
+    def _ensure_remote_flags(settings: dict, port: Optional[int]) -> bool:
+        changed = False
+
+        def update_key(key: str, value) -> None:
+            nonlocal changed
+            if settings.get(key) != value:
+                settings[key] = value
+                changed = True
+
+        for key in ("remoteControlEnabled", "remote_control_enabled", "remoteControl", "RemoteControlEnabled"):
+            if isinstance(settings.get(key), dict):
+                nested = settings[key]
+                if nested.get("enabled") is not True:
+                    nested["enabled"] = True
+                    changed = True
+                if port is not None and nested.get("port") != port:
+                    nested["port"] = port
+                    changed = True
+            else:
+                if key in {"remoteControl", "RemoteControlEnabled"}:
+                    continue
+                update_key(key, True)
+
+        if port is not None:
+            for key in ("remoteControlPort", "remote_control_port"):
+                if settings.get(key) != port:
+                    settings[key] = port
+                    changed = True
+
+        return changed
+
+    def ensure_remote_enabled(self, base_url: str) -> Tuple[bool, list[Path]]:
+        parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        candidates = self._candidate_files()
+        touched: list[Path] = []
+        updated = False
+
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            if self._ensure_remote_flags(data, port):
+                try:
+                    with open(path, "w", encoding="utf-8") as handle:
+                        json.dump(data, handle, indent=2, ensure_ascii=False)
+                    updated = True
+                    touched.append(path)
+                except OSError:
+                    continue
+            else:
+                touched.append(path)
+
+        if not candidates:
+            raise BlueMuseError(
+                "BlueMuse 설정 파일을 찾을 수 없습니다. BlueMuse를 한 번 실행한 뒤 다시 시도하세요."
+            )
+
+        return updated, touched
+
+
 # ----------------------------------------------------------------------
 # BrainFlow helpers
 # ----------------------------------------------------------------------
@@ -342,7 +561,10 @@ class Muse2StreamApp(tk.Tk):
 
         # BlueMuse 관련 상태
         self._bluemuse_client = BlueMuseClient()
-        self._bluemuse_path_var = tk.StringVar()
+        self._bluemuse_installer = BlueMuseInstaller()
+        self._bluemuse_settings = BlueMuseSettingsManager()
+        detected_exe = self._bluemuse_installer.detect_executable()
+        self._bluemuse_path_var = tk.StringVar(value=str(detected_exe) if detected_exe else "")
         self._bluemuse_url_var = tk.StringVar(value=self._bluemuse_client.base_url)
         self._use_bluemuse_control = tk.BooleanVar(value=True)
         self._device_list: list[BlueMuseDevice] = []
@@ -422,8 +644,24 @@ class Muse2StreamApp(tk.Tk):
         url_entry.grid(row=1, column=1, sticky="ew", pady=4)
         ttk.Button(frame, text="상태 확인", command=self._on_bluemuse_status).grid(row=1, column=2, padx=(4, 0), pady=4)
 
+        setup_row = ttk.Frame(frame)
+        setup_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        setup_row.columnconfigure(0, weight=1)
+        setup_row.columnconfigure(1, weight=1)
+
+        ttk.Button(
+            setup_row,
+            text="BlueMuse 설치/업데이트",
+            command=self._on_install_bluemuse,
+        ).grid(row=0, column=0, padx=2)
+        ttk.Button(
+            setup_row,
+            text="원격 제어 자동 설정",
+            command=self._on_configure_bluemuse_remote,
+        ).grid(row=0, column=1, padx=2)
+
         button_row = ttk.Frame(frame)
-        button_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(4, 8))
+        button_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(4, 8))
         for col in range(5):
             button_row.columnconfigure(col, weight=1)
 
@@ -434,7 +672,7 @@ class Muse2StreamApp(tk.Tk):
         ttk.Button(button_row, text="모두 해제", command=self._on_disconnect_all).grid(row=0, column=4, padx=2)
 
         list_frame = ttk.Frame(frame)
-        list_frame.grid(row=3, column=0, columnspan=3, sticky="ew")
+        list_frame.grid(row=4, column=0, columnspan=3, sticky="ew")
         list_frame.columnconfigure(0, weight=1)
 
         self._device_listbox = tk.Listbox(list_frame, height=6, exportselection=False)
@@ -445,7 +683,7 @@ class Muse2StreamApp(tk.Tk):
         self._device_listbox.bind("<Double-Button-1>", lambda _event: self._apply_selected_mac())
 
         actions = ttk.Frame(frame)
-        actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        actions.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         actions.columnconfigure(2, weight=1)
@@ -458,7 +696,7 @@ class Muse2StreamApp(tk.Tk):
             frame,
             text="녹화 시 BlueMuse로 자동 연결/해제",
             variable=self._use_bluemuse_control,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         return row + 1
 
@@ -514,6 +752,89 @@ class Muse2StreamApp(tk.Tk):
             return
         self._mac_var.set(device.address)
         self._log_message(f"선택한 장치 MAC 주소({device.address})를 입력란에 반영했습니다.")
+
+    def _on_install_bluemuse(self) -> None:
+        def worker() -> None:
+            try:
+                release = self._bluemuse_installer.fetch_latest_release()
+            except BlueMuseError as err:
+                self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                return
+
+            self._messages.put(
+                (
+                    "log",
+                    f"BlueMuse {release.version} 설치 파일({release.asset_name})을 다운로드합니다...",
+                )
+            )
+
+            try:
+                installer_path = self._bluemuse_installer.download_installer(release)
+            except BlueMuseError as err:
+                self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                return
+
+            installer_path = installer_path.resolve()
+            self._messages.put(("log", f"다운로드 완료: {installer_path}"))
+
+            try:
+                self._bluemuse_installer.run_installer(installer_path)
+            except BlueMuseError as err:
+                self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                return
+            finally:
+                try:
+                    installer_path.unlink()
+                except OSError:
+                    pass
+
+            self._messages.put(("log", "BlueMuse 설치 프로그램을 실행했습니다. 설치 마법사를 완료하세요."))
+
+            detected = self._bluemuse_installer.detect_executable()
+            if detected:
+                self._messages.put(("set_bluemuse_path", str(detected.resolve())))
+                self._messages.put(("log", f"BlueMuse 실행 파일 경로를 자동으로 설정했습니다: {detected}"))
+            else:
+                self._messages.put(("log", "설치 후 BlueMuse 실행 파일 경로를 직접 지정해야 할 수 있습니다."))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_configure_bluemuse_remote(self) -> None:
+        def worker() -> None:
+            try:
+                updated, touched = self._bluemuse_settings.ensure_remote_enabled(
+                    self._bluemuse_client.base_url
+                )
+            except BlueMuseError as err:
+                self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                return
+
+            if not touched:
+                self._messages.put(
+                    (
+                        "log",
+                        "BlueMuse 설정 파일을 수정하지 못했습니다. BlueMuse를 한 번 실행한 뒤 다시 시도하세요.",
+                    )
+                )
+                return
+
+            summary_path = touched[0]
+            if updated:
+                self._messages.put(
+                    (
+                        "log",
+                        f"BlueMuse 원격 제어를 자동으로 활성화했습니다. (예: {summary_path})",
+                    )
+                )
+            else:
+                self._messages.put(
+                    (
+                        "log",
+                        "BlueMuse 원격 제어가 이미 활성화되어 있습니다.",
+                    )
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_launch_bluemuse(self) -> None:
         def action() -> str:
@@ -766,6 +1087,21 @@ class Muse2StreamApp(tk.Tk):
             bluemuse_client = BlueMuseClient(base_url=bluemuse_base_url)
             bluemuse_path_obj = Path(bluemuse_path).expanduser() if bluemuse_path else None
 
+            try:
+                updated, touched = self._bluemuse_settings.ensure_remote_enabled(bluemuse_base_url)
+            except BlueMuseError as err:
+                self._messages.put(
+                    (
+                        "log",
+                        f"BlueMuse 원격 제어 설정을 자동으로 준비하지 못했습니다: {err}",
+                    )
+                )
+            else:
+                if touched and updated:
+                    self._messages.put(("log", "BlueMuse 원격 제어를 자동으로 활성화했습니다."))
+                elif touched:
+                    self._messages.put(("log", "BlueMuse 원격 제어가 이미 활성화되어 있습니다."))
+
             def wait_for_bluemuse(timeout: float) -> None:
                 deadline = time.monotonic() + max(0.0, timeout)
                 last_error: Optional[BlueMuseError] = None
@@ -930,6 +1266,9 @@ class Muse2StreamApp(tk.Tk):
                 if source != "bluemuse":
                     self._start_button.state(["!disabled"])
                     self._worker = None
+            elif kind == "set_bluemuse_path":
+                if payload:
+                    self._bluemuse_path_var.set(str(payload))
             elif kind == "success":
                 info = payload if isinstance(payload, dict) else {}
                 message = (
