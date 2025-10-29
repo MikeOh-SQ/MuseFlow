@@ -14,15 +14,16 @@
 
 ### 사용 방법
 
-저장소 루트에서 스크립트를 실행하고 Muse 2의 MAC 주소를 인자로 전달합니다. 기본적으로 20초 동안 데이터를 수집한 후 CSV 파일로 저장합니다.
+1. 저장소 루트에서 다음 명령으로 GUI를 실행합니다.
 
-```bash
-python scripts/muse2_windows_stream.py \
-    --mac-address AA:BB:CC:DD:EE:FF \
-    --duration 30 \
-    --output muse_capture.csv
-```
+   ```bash
+   python scripts/muse2_windows_stream.py
+   ```
 
-BrainFlow가 ``serial_port`` 필드에도 MAC 주소를 요구하는 경우, ``--serial-port`` 옵션을 사용해 동일한 값을 전달하세요.
+2. 나타난 창에서 Muse 2의 Bluetooth MAC 주소를 입력합니다. Windows Bluetooth 설정 또는 Muse Manager 앱에서 확인할 수 있습니다.
 
-``--show-summary`` 옵션을 사용하면 녹화가 끝난 뒤 채널별 요약 통계를 출력합니다.
+3. 필요한 경우 Serial Port, IP 설정, 녹화 시간, BrainFlow 버퍼 크기 등을 조정합니다. 기본값은 대부분의 상황에서 바로 사용할 수 있도록 설정되어 있습니다.
+
+4. 출력 CSV 파일 경로를 선택하고 **녹화 시작** 버튼을 누르면 스트리밍이 진행됩니다. 녹화가 끝나면 CSV 파일이 저장되고 요약 정보가 창 하단 로그에 표시됩니다.
+
+5. **채널 요약 출력** 옵션을 선택하면 각 채널의 최소/최대/평균값 요약이 함께 표시됩니다.
