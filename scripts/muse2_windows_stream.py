@@ -256,6 +256,8 @@ class BlueMuseInstaller:
     """GitHub 릴리스에서 BlueMuse 설치 파일을 내려받고 실행."""
 
     _RELEASE_API = "https://api.github.com/repos/kowalej/BlueMuse/releases/latest"
+    _LOCAL_FOLDER_NAMES = ("BlueMuse_2.4.0.0",)
+    _INSTALLER_SUFFIXES = (".msi", ".exe", ".msixbundle", ".msix")
 
     def __init__(self) -> None:
         self._opener = request.build_opener()
@@ -277,9 +279,8 @@ class BlueMuseInstaller:
         if not assets:
             raise BlueMuseError("BlueMuse 릴리스에 다운로드 가능한 자산이 없습니다.")
 
-        preferred_suffixes = (".msi", ".exe", ".msixbundle", ".msix")
         selected_asset: Optional[dict] = None
-        for suffix in preferred_suffixes:
+        for suffix in self._INSTALLER_SUFFIXES:
             for asset in assets:
                 if not isinstance(asset, dict):
                     continue
@@ -327,6 +328,47 @@ class BlueMuseInstaller:
             subprocess.Popen([str(installer_path)])
         except OSError as err:
             raise BlueMuseError(f"설치 프로그램 실행 실패: {err}") from err
+
+    def find_local_installer(self) -> Optional[Path]:
+        """배포 패키지에 포함된 BlueMuse 설치 파일을 우선적으로 검색."""
+
+        script_dir = Path(__file__).resolve().parent
+        candidate_bases = [script_dir, script_dir.parent, Path.cwd()]
+
+        visited: set[Path] = set()
+        for base in candidate_bases:
+            try:
+                base = base.resolve()
+            except OSError:
+                continue
+            if base in visited:
+                continue
+            visited.add(base)
+
+            for folder_name in self._LOCAL_FOLDER_NAMES:
+                direct = base / folder_name
+                if direct.is_dir():
+                    installer = self._pick_installer_from_directory(direct)
+                    if installer:
+                        return installer
+            # 폴더 이름이 이미 BlueMuse_* 형태인 경우를 대비해 현재 디렉터리도 검사합니다.
+            if base.name in self._LOCAL_FOLDER_NAMES and base.is_dir():
+                installer = self._pick_installer_from_directory(base)
+                if installer:
+                    return installer
+
+        return None
+
+    def _pick_installer_from_directory(self, directory: Path) -> Optional[Path]:
+        if not directory.is_dir():
+            return None
+
+        for suffix in self._INSTALLER_SUFFIXES:
+            matches = sorted(directory.glob(f"*{suffix}"))
+            for match in matches:
+                if match.is_file():
+                    return match
+        return None
 
     @staticmethod
     def detect_executable() -> Optional[Path]:
@@ -755,27 +797,49 @@ class Muse2StreamApp(tk.Tk):
 
     def _on_install_bluemuse(self) -> None:
         def worker() -> None:
-            try:
-                release = self._bluemuse_installer.fetch_latest_release()
-            except BlueMuseError as err:
-                self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
-                return
+            installer_path = self._bluemuse_installer.find_local_installer()
+            release: Optional[BlueMuseReleaseInfo] = None
+            downloaded = False
 
-            self._messages.put(
-                (
-                    "log",
-                    f"BlueMuse {release.version} 설치 파일({release.asset_name})을 다운로드합니다...",
+            if installer_path:
+                installer_path = installer_path.resolve()
+                self._messages.put(
+                    ("log", f"로컬 BlueMuse 설치 파일을 사용합니다: {installer_path}"),
                 )
-            )
+            else:
+                try:
+                    release = self._bluemuse_installer.fetch_latest_release()
+                except BlueMuseError as err:
+                    self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                    return
 
-            try:
-                installer_path = self._bluemuse_installer.download_installer(release)
-            except BlueMuseError as err:
-                self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                self._messages.put(
+                    (
+                        "log",
+                        f"BlueMuse {release.version} 설치 파일({release.asset_name})을 다운로드합니다...",
+                    )
+                )
+
+                try:
+                    installer_path = self._bluemuse_installer.download_installer(release).resolve()
+                    downloaded = True
+                except BlueMuseError as err:
+                    self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
+                    return
+
+                self._messages.put(("log", f"다운로드 완료: {installer_path}"))
+
+            if not installer_path:
+                self._messages.put(
+                    (
+                        "error",
+                        {
+                            "message": "BlueMuse 설치 파일을 찾지 못했습니다. GitHub 다운로드를 다시 시도하세요.",
+                            "source": "bluemuse",
+                        },
+                    )
+                )
                 return
-
-            installer_path = installer_path.resolve()
-            self._messages.put(("log", f"다운로드 완료: {installer_path}"))
 
             try:
                 self._bluemuse_installer.run_installer(installer_path)
@@ -783,10 +847,11 @@ class Muse2StreamApp(tk.Tk):
                 self._messages.put(("error", {"message": str(err), "source": "bluemuse"}))
                 return
             finally:
-                try:
-                    installer_path.unlink()
-                except OSError:
-                    pass
+                if downloaded:
+                    try:
+                        installer_path.unlink()
+                    except OSError:
+                        pass
 
             self._messages.put(("log", "BlueMuse 설치 프로그램을 실행했습니다. 설치 마법사를 완료하세요."))
 
