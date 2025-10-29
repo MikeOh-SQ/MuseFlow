@@ -737,6 +737,7 @@ class Muse2StreamApp(tk.Tk):
                 mac,
                 self._use_bluemuse_control.get(),
                 bluemuse_base_url,
+                self._bluemuse_path_var.get().strip() or None,
             ),
             daemon=True,
         )
@@ -753,6 +754,7 @@ class Muse2StreamApp(tk.Tk):
         mac_address: str,
         use_bluemuse: bool,
         bluemuse_base_url: str,
+        bluemuse_path: Optional[str],
     ) -> None:
         self._messages.put(("log", "Muse 2 연결을 시도합니다..."))
         board_id = BoardIds.MUSE_2_BOARD.value
@@ -762,6 +764,51 @@ class Muse2StreamApp(tk.Tk):
 
         if use_bluemuse:
             bluemuse_client = BlueMuseClient(base_url=bluemuse_base_url)
+            bluemuse_path_obj = Path(bluemuse_path).expanduser() if bluemuse_path else None
+
+            def wait_for_bluemuse(timeout: float) -> None:
+                deadline = time.monotonic() + max(0.0, timeout)
+                last_error: Optional[BlueMuseError] = None
+                while time.monotonic() <= deadline:
+                    try:
+                        bluemuse_client.status()
+                        return
+                    except BlueMuseError as err:
+                        last_error = err
+                        time.sleep(1.0)
+                if last_error is not None:
+                    raise last_error
+                raise BlueMuseError("BlueMuse 상태를 확인하지 못했습니다.")
+
+            try:
+                wait_for_bluemuse(timeout=3.0)
+            except BlueMuseError as err:
+                if bluemuse_path_obj and bluemuse_path_obj.is_file():
+                    self._messages.put(("log", "BlueMuse가 실행 중이 아닙니다. 자동 실행을 시도합니다..."))
+                    try:
+                        subprocess.Popen([str(bluemuse_path_obj)])
+                    except OSError as launch_err:
+                        self._messages.put(("error", f"BlueMuse 자동 실행 실패: {launch_err}"))
+                        return
+                    self._messages.put(("log", "BlueMuse 초기화를 기다리는 중입니다..."))
+                    try:
+                        wait_for_bluemuse(timeout=25.0)
+                    except BlueMuseError as wait_err:
+                        self._messages.put(("error", f"BlueMuse 원격 제어 준비 실패: {wait_err}"))
+                        return
+                else:
+                    hint = (
+                        "BlueMuse 실행 파일 경로를 GUI에서 설정하거나 BlueMuse를 직접 실행하세요."
+                        if not bluemuse_path_obj
+                        else "BlueMuse 실행 파일 경로가 올바른지 확인하세요."
+                    )
+                    self._messages.put((
+                        "error",
+                        f"BlueMuse 상태 확인 실패: {err}. {hint}",
+                    ))
+                    return
+
+            self._messages.put(("log", "BlueMuse 원격 제어 준비 완료."))
             self._messages.put(("log", "BlueMuse에 연결 요청을 전달합니다..."))
             try:
                 bluemuse_client.stop_scan()
