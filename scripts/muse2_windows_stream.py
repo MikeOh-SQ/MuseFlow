@@ -122,6 +122,12 @@ class BlueMuseClient:
             return response
         raise BlueMuseError(f"알 수 없는 상태 응답 형식: {type(response).__name__}")
 
+    @staticmethod
+    def _normalize_mac(address: str) -> str:
+        """BlueMuse가 보고한 MAC 주소를 비교하기 쉽게 정규화."""
+
+        return address.replace(":", "").replace("-", "").strip().lower()
+
     def list_devices(self) -> list[BlueMuseDevice]:
         response = self._request("GET", self._endpoints["devices"])
         if isinstance(response, dict):
@@ -181,6 +187,41 @@ class BlueMuseClient:
 
         parsed.sort(key=lambda item: (not item.connected, item.name))
         return parsed
+
+    def find_device(self, address: str) -> Optional[BlueMuseDevice]:
+        """현재 BlueMuse가 인식한 장치 중 ``address``와 일치하는 항목을 찾습니다."""
+
+        target = self._normalize_mac(address)
+        for device in self.list_devices():
+            if self._normalize_mac(device.address) == target:
+                return device
+        return None
+
+    def wait_for_state(
+        self,
+        address: str,
+        *,
+        connected: Optional[bool] = None,
+        timeout: float = 15.0,
+        interval: float = 0.5,
+    ) -> Optional[BlueMuseDevice]:
+        """지정한 주소의 장치가 원하는 연결 상태에 도달할 때까지 대기합니다."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        target = self._normalize_mac(address)
+        last_device: Optional[BlueMuseDevice] = None
+
+        while time.monotonic() <= deadline:
+            devices = self.list_devices()
+            for device in devices:
+                if self._normalize_mac(device.address) != target:
+                    continue
+                last_device = device
+                if connected is None or device.connected == connected:
+                    return device
+            time.sleep(interval)
+
+        return last_device
 
     def start_scan(self) -> None:
         self._request("POST", self._endpoints["start_scan"])
@@ -303,6 +344,7 @@ class Muse2StreamApp(tk.Tk):
         self._bluemuse_client = BlueMuseClient()
         self._bluemuse_path_var = tk.StringVar()
         self._bluemuse_url_var = tk.StringVar(value=self._bluemuse_client.base_url)
+        self._use_bluemuse_control = tk.BooleanVar(value=True)
         self._device_list: list[BlueMuseDevice] = []
         self._device_listbox: Optional[tk.Listbox] = None
 
@@ -411,6 +453,12 @@ class Muse2StreamApp(tk.Tk):
         ttk.Button(actions, text="선택 연결", command=self._on_connect_selected).grid(row=0, column=0, padx=2)
         ttk.Button(actions, text="선택 해제", command=self._on_disconnect_selected).grid(row=0, column=1, padx=2)
         ttk.Button(actions, text="MAC 입력", command=self._apply_selected_mac).grid(row=0, column=2, padx=2)
+
+        ttk.Checkbutton(
+            frame,
+            text="녹화 시 BlueMuse로 자동 연결/해제",
+            variable=self._use_bluemuse_control,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         return row + 1
 
@@ -675,9 +723,21 @@ class Muse2StreamApp(tk.Tk):
 
         self._start_button.state(["disabled"])
 
+        bluemuse_base_url = self._bluemuse_client.base_url
+
         self._worker = threading.Thread(
             target=self._run_capture,
-            args=(params, duration, chunk_size, extra_wait, output_path, self._show_summary.get()),
+            args=(
+                params,
+                duration,
+                chunk_size,
+                extra_wait,
+                output_path,
+                self._show_summary.get(),
+                mac,
+                self._use_bluemuse_control.get(),
+                bluemuse_base_url,
+            ),
             daemon=True,
         )
         self._worker.start()
@@ -690,9 +750,45 @@ class Muse2StreamApp(tk.Tk):
         extra_wait: float,
         output_path: Path,
         show_summary: bool,
+        mac_address: str,
+        use_bluemuse: bool,
+        bluemuse_base_url: str,
     ) -> None:
         self._messages.put(("log", "Muse 2 연결을 시도합니다..."))
         board_id = BoardIds.MUSE_2_BOARD.value
+
+        bluemuse_client: Optional[BlueMuseClient] = None
+        bluemuse_connected = False
+
+        if use_bluemuse:
+            bluemuse_client = BlueMuseClient(base_url=bluemuse_base_url)
+            self._messages.put(("log", "BlueMuse에 연결 요청을 전달합니다..."))
+            try:
+                bluemuse_client.stop_scan()
+            except BlueMuseError:
+                pass
+            try:
+                bluemuse_client.connect(mac_address)
+            except BlueMuseError as err:
+                self._messages.put(("error", f"BlueMuse 연결 실패: {err}"))
+                return
+
+            try:
+                device = bluemuse_client.wait_for_state(mac_address, connected=True, timeout=20.0)
+            except BlueMuseError as err:
+                self._messages.put(("error", f"BlueMuse 상태 확인 실패: {err}"))
+                return
+            if not device or not device.connected:
+                self._messages.put(
+                    (
+                        "error",
+                        "BlueMuse가 Muse 헤드셋과 연결하지 못했습니다. BlueMuse 상태를 확인하세요.",
+                    )
+                )
+                return
+
+            bluemuse_connected = True
+            self._messages.put(("log", f"BlueMuse가 {device.name}과(와) 연결되었습니다."))
 
         try:
             data = collect_data(
@@ -708,6 +804,14 @@ class Muse2StreamApp(tk.Tk):
         except Exception as err:  # pylint: disable=broad-except
             self._messages.put(("error", f"예상치 못한 오류: {err}"))
             return
+        finally:
+            if use_bluemuse and bluemuse_client and bluemuse_connected:
+                try:
+                    self._messages.put(("log", "BlueMuse에 연결 해제를 요청합니다..."))
+                    bluemuse_client.disconnect(mac_address)
+                    bluemuse_client.wait_for_state(mac_address, connected=False, timeout=10.0)
+                except BlueMuseError as err:
+                    self._messages.put(("log", f"BlueMuse 연결 해제 중 오류가 발생했습니다: {err}"))
 
         if not data or not data[0]:
             self._messages.put(("error", "헤드셋에서 데이터를 수신하지 못했습니다. Bluetooth 연결을 확인하세요."))
